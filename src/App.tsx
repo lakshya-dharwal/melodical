@@ -14,6 +14,7 @@ import {
 } from "./song";
 import { deleteTake, getTakes, loadProjects, putTake, saveProjects, uid, type Project, type Take } from "./store";
 import { transposeSong } from "./theory";
+import { askConfirm, askText, askTextAndChoice, DialogHost, notify } from "./dialog";
 import { ChordInput, Chips, Fader, Label, PauseIcon, PlayIcon, StartIcon, Stepper, StopIcon } from "./ui";
 import { autotune, detectScale, MicRecorder } from "./vocal";
 
@@ -257,7 +258,7 @@ export default function App() {
       setBusy("Waiting for the microphone…");
       await recorder.init();
     } catch (e) {
-      alert("Microphone blocked. Allow mic access for this site and try again.\n\n" + (e as Error).message);
+      notify("Microphone blocked", "Allow mic access for this site in your browser’s address bar, then try again. (" + (e as Error).message + ")");
       return;
     } finally {
       setBusy(null);
@@ -354,7 +355,7 @@ export default function App() {
   };
 
   const removeTake = async (t: Take) => {
-    if (!confirm(`Delete "${t.name}"? This can't be undone.`)) return;
+    if (!(await askConfirm(`Delete “${t.name}”?`, "This take will be gone for good. Download it first if you might want it later."))) return;
     await deleteTake(t.id);
     setTakes((ts) => ts.filter((x) => x.id !== t.id));
     if (selectedTake === t.id) setSelectedTake(null);
@@ -380,7 +381,7 @@ export default function App() {
       await fn();
     } catch (e) {
       console.error(e);
-      alert("Export failed: " + (e as Error).message);
+      notify("Export didn’t finish", (e as Error).message);
     } finally {
       setBusy(null);
     }
@@ -490,19 +491,25 @@ export default function App() {
     player.load(p.opts.instrument);
   };
 
-  const createProject = () => {
-    const name = prompt("Name your song", "Untitled")?.trim();
-    if (!name) return;
-    const p = newProject(name, PRESETS[1].text);
+  const createProject = async () => {
+    setMenu(false);
+    const r = await askTextAndChoice(
+      "New song",
+      "",
+      PRESETS.map((p, i) => ({ id: String(i), label: p.name, hint: `${p.text.match(/^tempo:\s*(\d+)/m)?.[1] ?? "90"} bpm` })),
+    );
+    if (!r) return;
+    const p = newProject(r.name, PRESETS[Number(r.choice)].text);
     const next = [...projects, p];
     setProjects(next);
     saveProjects(next, currentId);
     openProject(p.id, next);
   };
 
-  const renameProject = () => {
-    const name = prompt("Rename song", project.name)?.trim();
-    if (!name) return;
+  const renameProject = async () => {
+    setMenu(false);
+    const name = await askText("Rename song", project.name, { confirm: "Rename" });
+    if (!name || name === project.name) return;
     setProjects((ps) => {
       const next = ps.map((p) => (p.id === currentId ? { ...p, name } : p));
       saveProjects(next, currentId);
@@ -510,6 +517,23 @@ export default function App() {
     });
     const t = text.replace(/^title:.*$/m, `title: ${name}`);
     applyText(/^title:/m.test(t) ? t : `title: ${name}\n${t}`);
+  };
+
+  const removeProject = async () => {
+    setMenu(false);
+    if (projects.length <= 1) return;
+    const ok = await askConfirm(
+      `Delete “${project.name}”?`,
+      `Its chords, settings and ${takes.length} take${takes.length === 1 ? "" : "s"} will be deleted from this browser. Export a pack first if you want to keep anything.`,
+      "Delete song",
+    );
+    if (!ok) return;
+    const gone = project.id;
+    await Promise.all(takes.map((t) => deleteTake(t.id)));
+    const rest = projects.filter((p) => p.id !== gone);
+    openProject(rest[0].id, rest);
+    setProjects(rest);
+    saveProjects(rest, rest[0].id);
   };
 
   // ---------- derived view state ----------
@@ -526,6 +550,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <DialogHost />
       <header className="top">
         <div className="brand">
           <span className="dot" /> MELODICAL
@@ -537,18 +562,34 @@ export default function App() {
             <span className="caret">▾</span>
           </button>
           {menu && (
-            <div className="proj-menu" onMouseLeave={() => setMenu(false)}>
-              {projects.map((p) => (
-                <button key={p.id} className={p.id === currentId ? "on" : ""} onClick={() => openProject(p.id)}>
-                  {p.name}
-                  <span>{new Date(p.updatedAt).toLocaleDateString()}</span>
-                </button>
-              ))}
-              <div className="proj-actions">
-                <button onClick={createProject}>+ New song</button>
-                <button onClick={renameProject}>Rename</button>
+            <>
+              <div className="scrim" onMouseDown={() => setMenu(false)} />
+              <div className="proj-menu pop">
+                <div className="pop-head">Your songs</div>
+                <div className="proj-list">
+                  {[...projects]
+                    .sort((x, y) => y.updatedAt - x.updatedAt)
+                    .map((p) => (
+                      <button key={p.id} className={`proj-row ${p.id === currentId ? "on" : ""}`} onClick={() => openProject(p.id)}>
+                        <i />
+                        <b>{p.name}</b>
+                        <span>{p.id === currentId ? "Open" : new Date(p.updatedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+                      </button>
+                    ))}
+                </div>
+                <div className="pop-foot">
+                  <button className="primary" onClick={createProject}>
+                    + New song
+                  </button>
+                  <button className="ghost" onClick={renameProject}>
+                    Rename
+                  </button>
+                  <button className="ghost danger" onClick={removeProject} disabled={projects.length <= 1} title={projects.length <= 1 ? "You need at least one song" : "Delete this song"}>
+                    Delete
+                  </button>
+                </div>
               </div>
-            </div>
+            </>
           )}
         </div>
         <div className="top-meta">
