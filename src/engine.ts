@@ -1,6 +1,7 @@
 // Audio engine: turns the laid-out chord timeline into notes, eighth-note by eighth-note.
 // The same note generator drives live playback (lookahead scheduler) and WAV export (offline render).
 import { ElectricPiano, renderOffline, Soundfont, SplendidGrandPiano, type NoteEvent } from "smplr";
+import { buildMaster, buildVocalChain, DEFAULT_MIX, impulse, type MixSettings, type VocalChain, type MasterChain, type VocalClip } from "./mix";
 import type { Block } from "./song";
 import { bassNote, fifthAbove, guitarVoicing, keysVoicing, parseChord, type ParsedChord } from "./theory";
 
@@ -179,16 +180,6 @@ function playDrum(ctx: BaseAudioContext, dest: AudioNode, hit: DrumHit, t: numbe
 }
 
 // ---------- mix bus ----------
-
-function impulse(ctx: BaseAudioContext, seconds = 2.6) {
-  const len = Math.floor(ctx.sampleRate * seconds);
-  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
-  for (let c = 0; c < 2; c++) {
-    const d = buf.getChannelData(c);
-    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2);
-  }
-  return buf;
-}
 
 type Bus = {
   harmony: GainNode;
@@ -390,6 +381,12 @@ export class Player {
   ctx = new AudioContext({ latencyHint: "interactive" });
   private opts: Options;
   private bus: Bus;
+  private instGain: GainNode;
+  private master: MasterChain;
+  private vocalChain: VocalChain;
+  private vocal: VocalClip | null = null;
+  private vocalSrc: AudioBufferSourceNode | null = null;
+  private vocalBuf: AudioBuffer | null = null;
   private voices = new Map<string, Voice>();
   private bass: Voice;
   private flat: Flat = [];
@@ -408,8 +405,13 @@ export class Player {
 
   constructor(opts: Options) {
     this.opts = opts;
-    this.bus = makeBus(this.ctx, this.ctx.destination, opts);
+    this.master = buildMaster(this.ctx, this.ctx.destination);
+    this.instGain = this.ctx.createGain();
+    this.instGain.connect(this.master.input);
+    this.vocalChain = buildVocalChain(this.ctx, this.master.input);
+    this.bus = makeBus(this.ctx, this.instGain, opts);
     this.bass = smplrVoice(Soundfont(this.ctx, { instrument: "electric_bass_finger", destination: this.bus.bass, volume: 105 }));
+    this.setMix(DEFAULT_MIX);
   }
 
   /** Load (or reuse) an instrument. Resolves when it can play. */
@@ -426,6 +428,23 @@ export class Player {
     if (opts.instrument !== this.opts.instrument) this.voices.get(this.opts.instrument)?.stop();
     this.opts = opts;
     applyLevels(this.bus, opts);
+  }
+
+  setMix(m: MixSettings) {
+    this.instGain.gain.value = m.inst;
+    this.vocalChain.set(m);
+    this.master.set(m.master);
+  }
+
+  /** The take that plays along with the band (null = none). */
+  setVocal(v: VocalClip | null) {
+    this.vocal = v;
+    this.vocalBuf = null;
+    if (v) {
+      this.vocalBuf = this.ctx.createBuffer(1, v.data.length, v.sampleRate);
+      this.vocalBuf.copyToChannel(v.data as Float32Array<ArrayBuffer>, 0);
+    }
+    if (this.playing) this.syncVocal(this.getBeat(), this.ctx.currentTime + 0.03);
   }
 
   setSong(blocks: Block[], totalBeats: number) {
@@ -458,15 +477,17 @@ export class Player {
     return last.beat + Math.min(0.5, ((now - last.time) * this.bpm) / 60);
   }
 
-  async play(fromBeat = this.pausedBeat) {
+  /** Starts playback; resolves with the AudioContext time at which `beat` sounds. */
+  async play(fromBeat = this.pausedBeat): Promise<{ time: number; beat: number }> {
     await this.ctx.resume();
     await this.load(this.opts.instrument);
     if (fromBeat >= this.totalBeats) fromBeat = 0;
     this.playing = true;
     this.endAt = null;
-    this.rebase(fromBeat);
+    const anchor = this.rebase(fromBeat);
     if (this.timer === null) this.timer = window.setInterval(() => this.tick(), TICK_MS);
     this.tick();
+    return anchor;
   }
 
   pause() {
@@ -489,13 +510,31 @@ export class Player {
   private rebase(beat: number) {
     const step = Math.floor(beat * 2 + 1e-6);
     this.nextStep = step;
-    this.nextTime = this.ctx.currentTime + 0.06;
+    this.nextTime = this.ctx.currentTime + 0.08;
     this.queue = [];
+    this.syncVocal(step / 2, this.nextTime);
+    return { time: this.nextTime, beat: step / 2 };
+  }
+
+  private syncVocal(beat: number, at: number) {
+    this.vocalSrc?.stop();
+    this.vocalSrc = null;
+    if (!this.vocal || !this.vocalBuf || !this.playing) return;
+    const into = (beat * 60) / this.bpm - this.vocal.offset; // seconds into the take
+    if (into >= this.vocalBuf.duration) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.vocalBuf;
+    src.connect(this.vocalChain.input);
+    if (into >= 0) src.start(at, into);
+    else src.start(at - into);
+    this.vocalSrc = src;
   }
 
   private silence() {
     this.voices.forEach((v) => v.stop());
     this.bass.stop();
+    this.vocalSrc?.stop();
+    this.vocalSrc = null;
   }
 
   private halt() {
@@ -516,6 +555,7 @@ export class Player {
       if (this.loop && beat >= this.loop.end) {
         this.nextStep = Math.floor(this.loop.start * 2);
         beat = this.nextStep / 2;
+        this.syncVocal(beat, this.nextTime);
       }
       if (beat >= this.totalBeats) {
         this.endAt = this.nextTime;
@@ -536,21 +576,29 @@ export class Player {
   }
 }
 
-// ---------- export ----------
+// ---------- instrumental render (cached) ----------
 
-export async function exportWav(
-  blocks: Block[],
-  totalBeats: number,
-  bpm: number,
-  opts: Options,
-  onStatus: (s: string) => void,
-) {
+const SR = 44100;
+const renderCache = new Map<string, Promise<AudioBuffer>>();
+
+export function instrumentalKey(blocks: Block[], bpm: number, opts: Options) {
+  const chords = blocks.map((b) => [b.index === 0 || /intro|outro/i.test(b.name), b.chords.map((c) => c.symbol + ":" + c.beats).join(",")]);
+  return JSON.stringify([chords, bpm, opts]);
+}
+
+/**
+ * Renders the band (no vocal) offline. Memoised by content, so the background pre-render
+ * makes "Export" instant, and the mix/pack exports reuse the same buffer.
+ */
+export function renderInstrumental(blocks: Block[], totalBeats: number, bpm: number, opts: Options): Promise<AudioBuffer> {
+  const key = instrumentalKey(blocks, bpm, opts);
+  const hit = renderCache.get(key);
+  if (hit) return hit;
+  if (renderCache.size > 4) renderCache.delete(renderCache.keys().next().value!);
   const spb = 60 / bpm;
-  const seconds = totalBeats * spb + 3;
   const kind = INSTRUMENTS.find((i) => i.id === opts.instrument)?.kind ?? "keys";
   const flat = flatten(blocks);
-  onStatus("Loading samples…");
-  const result = await renderOffline(
+  const job = renderOffline(
     async (ctx) => {
       const bus = makeBus(ctx, ctx.destination, opts);
       const harmony = makeHarmony(opts.instrument, ctx, bus.harmony);
@@ -558,10 +606,16 @@ export async function exportWav(
         ? smplrVoice(Soundfont(ctx, { instrument: "electric_bass_finger", destination: bus.bass, volume: 105 }))
         : null;
       await Promise.all([harmony.ready, bass?.ready]);
-      onStatus("Rendering…");
-      for (let s = 0; s < totalBeats * 2; s++) emit(ctx, stepHits(flat, s, opts, kind), 0.05 + (s / 2) * spb, spb, harmony, bass, bus);
+      // Song timeline starts at exactly 0 so stems line up sample-accurately in a DAW.
+      for (let s = 0; s < totalBeats * 2; s++) emit(ctx, stepHits(flat, s, opts, kind), (s / 2) * spb, spb, harmony, bass, bus);
     },
-    { duration: seconds, sampleRate: 44100 },
-  );
-  return result.toWav16();
+    { duration: totalBeats * spb + 3, sampleRate: SR },
+  ).then((r) => r.audioBuffer);
+  job.catch(() => renderCache.delete(key));
+  renderCache.set(key, job);
+  return job;
+}
+
+export function isRendered(blocks: Block[], bpm: number, opts: Options) {
+  return renderCache.has(instrumentalKey(blocks, bpm, opts));
 }

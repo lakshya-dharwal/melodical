@@ -1,6 +1,6 @@
 // Song model + the "chord map" text format.
 //
-//   title: Pehle Bhi Main
+//   title: Aaina
 //   tempo: 80
 //
 //   [Mukhda]
@@ -244,11 +244,11 @@ export function fmtTime(sec: number) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// The progression from your ChatGPT analysis of "Pehle Bhi Main" (A minor, acoustic ballad).
+// Starter progressions. The first is the A-minor ballad the Aaina project starts from.
 export const PRESETS: { name: string; text: string }[] = [
   {
-    name: "Pehle Bhi Main · ballad",
-    text: `title: Pehle Bhi Main
+    name: "A-minor ballad",
+    text: `title: Aaina
 tempo: 80
 
 [Mukhda]
