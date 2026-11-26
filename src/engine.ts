@@ -1,6 +1,15 @@
 // Audio engine: turns the laid-out chord timeline into notes, eighth-note by eighth-note.
 // The same note generator drives live playback (lookahead scheduler) and WAV export (offline render).
-import { ElectricPiano, renderOffline, Soundfont, SplendidGrandPiano, type NoteEvent } from "smplr";
+import { ElectricPiano, renderOffline, Scheduler, Soundfont, SplendidGrandPiano, type NoteEvent } from "smplr";
+
+/**
+ * smplr normally holds future notes in a queue drained by a 50 ms page timer. Browsers throttle page
+ * timers in background tabs (Safari to ~1 s) and offline renders outrun them, so notes arrived late or
+ * never. An "eager" scheduler with an effectively infinite lookahead hands every note to the audio
+ * clock the moment we schedule it, which is immune to both.
+ */
+const eager = (ctx: BaseAudioContext) => Scheduler(ctx, { lookaheadMs: 1e9, intervalMs: 1000 });
+type Sched = ReturnType<typeof eager>;
 import { buildMaster, buildVocalChain, DEFAULT_MIX, DEFAULT_VOICE, impulse, type MasterChain, type MixSettings, type VocalChain, type VocalClip, type Voice as VocalVoice } from "./mix";
 import type { Block } from "./song";
 import { bassNote, fifthAbove, guitarVoicing, keysVoicing, parseChord, type ParsedChord } from "./theory";
@@ -93,20 +102,20 @@ function synthVoice(ctx: BaseAudioContext, dest: AudioNode): Voice {
   };
 }
 
-function makeHarmony(id: string, ctx: BaseAudioContext, dest: AudioNode): Voice {
+function makeHarmony(id: string, ctx: BaseAudioContext, dest: AudioNode, scheduler: Sched): Voice {
   switch (id) {
     case "piano":
-      return smplrVoice(SplendidGrandPiano(ctx, { destination: dest, volume: 110 }));
+      return smplrVoice(SplendidGrandPiano(ctx, { destination: dest, volume: 110, scheduler }));
     case "guitar":
-      return smplrVoice(Soundfont(ctx, { instrument: "acoustic_guitar_steel", destination: dest }));
+      return smplrVoice(Soundfont(ctx, { instrument: "acoustic_guitar_steel", destination: dest, scheduler }));
     case "nylon":
-      return smplrVoice(Soundfont(ctx, { instrument: "acoustic_guitar_nylon", destination: dest, volume: 127, extraGain: 2.5 }));
+      return smplrVoice(Soundfont(ctx, { instrument: "acoustic_guitar_nylon", destination: dest, volume: 127, extraGain: 2.5, scheduler }));
     case "epiano":
-      return smplrVoice(ElectricPiano(ctx, { instrument: "CP80", destination: dest }));
+      return smplrVoice(ElectricPiano(ctx, { instrument: "CP80", destination: dest, scheduler }));
     case "strings":
-      return smplrVoice(Soundfont(ctx, { instrument: "string_ensemble_1", destination: dest, volume: 90 }));
+      return smplrVoice(Soundfont(ctx, { instrument: "string_ensemble_1", destination: dest, volume: 90, scheduler }));
     case "pad":
-      return smplrVoice(Soundfont(ctx, { instrument: "pad_2_warm", destination: dest, volume: 90 }));
+      return smplrVoice(Soundfont(ctx, { instrument: "pad_2_warm", destination: dest, volume: 90, scheduler }));
     default:
       return synthVoice(ctx, dest);
   }
@@ -362,20 +371,44 @@ function emit(
   secPerBeat: number,
   harmony: Voice,
   bass: Voice | null,
-  bus: Bus,
+  drums: AudioNode,
 ) {
   for (const h of hits) {
     const swingless = time + h.at * secPerBeat;
     if (h.part === "harmony") harmony.play(h.midi, swingless + (h.delay ?? 0), h.beats * secPerBeat, h.vel);
     else if (h.part === "bass") bass?.play(h.midi, swingless, h.beats * secPerBeat, h.vel);
-    else playDrum(ctx, bus.drums, h.hit, swingless, h.vel);
+    else playDrum(ctx, drums, h.hit, swingless, h.vel);
   }
 }
 
 // ---------- live player ----------
 
-const LOOKAHEAD = 0.15;
+// How far ahead notes are committed to the audio clock. Short while you're watching (instant reaction to
+// edits), long while the tab is in the background (survives the browser throttling our timer to ~1 s).
+const LOOKAHEAD_VISIBLE = 0.15;
+const LOOKAHEAD_HIDDEN = 2.5;
 const TICK_MS = 25;
+
+/** A ticking clock in a Worker: worker timers keep firing when the page is in the background. */
+function workerClock(onTick: () => void): { start(): void; stop(): void } {
+  try {
+    const src = `let id=null;onmessage=e=>{if(e.data==="start"&&id===null)id=setInterval(()=>postMessage(0),${TICK_MS});if(e.data==="stop"){clearInterval(id);id=null}}`;
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: "application/javascript" })));
+    w.onmessage = onTick;
+    return { start: () => w.postMessage("start"), stop: () => w.postMessage("stop") };
+  } catch {
+    let id: number | null = null;
+    return {
+      start: () => {
+        id ??= window.setInterval(onTick, TICK_MS);
+      },
+      stop: () => {
+        if (id !== null) clearInterval(id);
+        id = null;
+      },
+    };
+  }
+}
 
 export class Player {
   ctx = new AudioContext({ latencyHint: "interactive" });
@@ -396,7 +429,10 @@ export class Player {
   private bpm = 90;
   private loop: { start: number; end: number } | null = null;
 
-  private timer: number | null = null;
+  private sched: Sched;
+  private clock = workerClock(() => this.tick());
+  private ticking = false;
+  private drumGate: GainNode;
   private nextStep = 0;
   private nextTime = 0;
   private queue: { time: number; beat: number }[] = [];
@@ -412,7 +448,14 @@ export class Player {
     this.instGain.connect(this.master.input);
     this.vocalChain = buildVocalChain(this.ctx, this.master.input);
     this.bus = makeBus(this.ctx, this.instGain, opts);
-    this.bass = smplrVoice(Soundfont(this.ctx, { instrument: "electric_bass_finger", destination: this.bus.bass, volume: 105 }));
+    this.sched = eager(this.ctx);
+    this.drumGate = this.ctx.createGain();
+    this.drumGate.connect(this.bus.drums);
+    this.bass = smplrVoice(
+      Soundfont(this.ctx, { instrument: "electric_bass_finger", destination: this.bus.bass, volume: 105, scheduler: this.sched }),
+    );
+    // When the tab hides, top the queue up straight away instead of waiting for the next tick.
+    document.addEventListener("visibilitychange", () => this.playing && this.tick());
     this.setMix(DEFAULT_MIX);
   }
 
@@ -420,7 +463,7 @@ export class Player {
   async load(id: string) {
     let v = this.voices.get(id);
     if (!v) {
-      v = makeHarmony(id, this.ctx, this.bus.harmony);
+      v = makeHarmony(id, this.ctx, this.bus.harmony, this.sched);
       this.voices.set(id, v);
     }
     await v.ready;
@@ -494,7 +537,10 @@ export class Player {
     this.playing = true;
     this.endAt = null;
     const anchor = this.rebase(fromBeat);
-    if (this.timer === null) this.timer = window.setInterval(() => this.tick(), TICK_MS);
+    if (!this.ticking) {
+      this.clock.start();
+      this.ticking = true;
+    }
     this.tick();
     return anchor;
   }
@@ -542,14 +588,18 @@ export class Player {
   private silence() {
     this.voices.forEach((v) => v.stop());
     this.bass.stop();
+    // Drums are raw Web Audio nodes already queued on the clock; cut them by swapping the gate they feed.
+    this.drumGate.disconnect();
+    this.drumGate = this.ctx.createGain();
+    this.drumGate.connect(this.bus.drums);
     this.vocalSrc?.stop();
     this.vocalSrc = null;
   }
 
   private halt() {
     this.playing = false;
-    if (this.timer !== null) clearInterval(this.timer);
-    this.timer = null;
+    this.clock.stop();
+    this.ticking = false;
     this.queue = [];
     this.silence();
   }
@@ -558,8 +608,9 @@ export class Player {
     const now = this.ctx.currentTime;
     const voice = this.voices.get(this.opts.instrument);
     const kind = INSTRUMENTS.find((i) => i.id === this.opts.instrument)?.kind ?? "keys";
+    const ahead = document.hidden ? LOOKAHEAD_HIDDEN : LOOKAHEAD_VISIBLE;
     let guard = 0;
-    while (this.endAt === null && this.nextTime < now + LOOKAHEAD && guard++ < 64) {
+    while (this.endAt === null && this.nextTime < now + ahead && guard++ < 512) {
       let beat = this.nextStep / 2;
       if (this.loop && beat >= this.loop.end) {
         this.nextStep = Math.floor(this.loop.start * 2);
@@ -571,7 +622,9 @@ export class Player {
         break;
       }
       const spb = 60 / this.bpm;
-      if (voice) emit(this.ctx, stepHits(this.flat, this.nextStep, this.opts, kind), this.nextTime, spb, voice, this.bass, this.bus);
+      // A step whose moment already passed (tab was frozen) is skipped, not crammed in late as a burst.
+      if (voice && this.nextTime >= now - 0.01)
+        emit(this.ctx, stepHits(this.flat, this.nextStep, this.opts, kind), this.nextTime, spb, voice, this.bass, this.drumGate);
       this.queue.push({ time: this.nextTime, beat });
       if (this.queue.length > 64) this.queue.shift();
       this.nextTime += spb / 2;
@@ -592,7 +645,7 @@ const renderCache = new Map<string, Promise<AudioBuffer>>();
 
 export function instrumentalKey(blocks: Block[], bpm: number, opts: Options) {
   const chords = blocks.map((b) => [b.index === 0 || /intro|outro/i.test(b.name), b.chords.map((c) => c.symbol + ":" + c.beats).join(",")]);
-  return JSON.stringify([chords, bpm, opts]);
+  return JSON.stringify([2, chords, bpm, opts]);
 }
 
 /**
@@ -610,13 +663,14 @@ export function renderInstrumental(blocks: Block[], totalBeats: number, bpm: num
   const job = renderOffline(
     async (ctx) => {
       const bus = makeBus(ctx, ctx.destination, opts);
-      const harmony = makeHarmony(opts.instrument, ctx, bus.harmony);
+      const sched = eager(ctx);
+      const harmony = makeHarmony(opts.instrument, ctx, bus.harmony, sched);
       const bass = opts.bass
-        ? smplrVoice(Soundfont(ctx, { instrument: "electric_bass_finger", destination: bus.bass, volume: 105 }))
+        ? smplrVoice(Soundfont(ctx, { instrument: "electric_bass_finger", destination: bus.bass, volume: 105, scheduler: sched }))
         : null;
       await Promise.all([harmony.ready, bass?.ready]);
       // Song timeline starts at exactly 0 so stems line up sample-accurately in a DAW.
-      for (let s = 0; s < totalBeats * 2; s++) emit(ctx, stepHits(flat, s, opts, kind), (s / 2) * spb, spb, harmony, bass, bus);
+      for (let s = 0; s < totalBeats * 2; s++) emit(ctx, stepHits(flat, s, opts, kind), (s / 2) * spb, spb, harmony, bass, bus.drums);
     },
     { duration: totalBeats * spb + 3, sampleRate: SR },
   ).then((r) => r.audioBuffer);
