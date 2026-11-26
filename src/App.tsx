@@ -108,6 +108,8 @@ export default function App() {
   const [selectedTake, setSelectedTake] = useState<string | null>(bootProject.selectedTake);
   const [takes, setTakes] = useState<Take[]>([]);
   const [pending, setPending] = useState<Take | null>(null);
+  // Play the band alone, or the band with the picked take singing along.
+  const [withVocal, setWithVocal] = useState(false);
 
   // ---------- app ----------
   const [page, setPage] = useState<Page>("home");
@@ -194,7 +196,7 @@ export default function App() {
   useEffect(() => player.setVoice(activeVoice), [player, activeVoice]);
 
   useEffect(() => {
-    if (recording || !activeTake) {
+    if (recording || !activeTake || !withVocal) {
       player.setVocal(null);
       return;
     }
@@ -211,7 +213,7 @@ export default function App() {
       clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [player, activeTake?.id, activeTake?.nudgeMs, recording, activeVoice.tune, clipFor]);
+  }, [player, activeTake?.id, activeTake?.nudgeMs, recording, withVocal, activeVoice.tune, clipFor]);
 
   // per-take edits (voice, nudge, name) save quietly in the background
   const saveTimers = useRef(new Map<string, number>());
@@ -376,6 +378,24 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [player, opts.instrument]);
 
+  /** Band-only and with-vocal are separate buttons: each pauses its own mode, or switches mode mid-song. */
+  const playMode = async (vocal: boolean) => {
+    if (recMeta.current) return stopAll();
+    if (player.playing && withVocal === vocal) {
+      player.pause();
+      setPlaying(false);
+      setBeat(player.getBeat());
+      return;
+    }
+    setWithVocal(vocal);
+    if (!player.playing) {
+      setLoading(opts.instrument);
+      await player.play();
+      setLoading(null);
+      setPlaying(true);
+    }
+  };
+
   const playFromStart = async () => {
     if (recMeta.current) stopAll();
     if (player.playing) return seek(0);
@@ -429,6 +449,7 @@ export default function App() {
 
   const listenTo = async (t: Take) => {
     if (t.id !== pending?.id) setSelectedTake(t.id);
+    setWithVocal(true);
     const songBeat = (takeOffset(t, sync) * song.bpm) / 60;
     const c = blocks.flatMap((b) => b.chords).filter((ch) => ch.startBeat <= songBeat + 0.01).at(-1);
     const from = c ? c.startBeat : 0;
@@ -567,16 +588,16 @@ export default function App() {
     openProject(p.id, next, "compose");
   };
 
-  const renameProject = async () => {
-    const name = await askText("Rename song", project.name, { confirm: "Rename" });
-    if (!name || name === project.name) return;
+  const renameProject = async (target: Project = project) => {
+    const name = await askText("Rename song", target.name, { confirm: "Rename" });
+    if (!name || name === target.name) return;
+    const retitle = (t: string) => (/^title:/m.test(t) ? t.replace(/^title:.*$/m, `title: ${name}`) : `title: ${name}\n${t}`);
     setProjects((ps) => {
-      const next = ps.map((p) => (p.id === currentId ? { ...p, name } : p));
+      const next = ps.map((p) => (p.id === target.id ? { ...p, name, text: p.id === currentId ? p.text : retitle(p.text) } : p));
       saveProjects(next, currentId);
       return next;
     });
-    const t = text.replace(/^title:.*$/m, `title: ${name}`);
-    applyText(/^title:/m.test(t) ? t : `title: ${name}\n${t}`);
+    if (target.id === currentId) applyText(retitle(text));
   };
 
   const removeProject = async (p: Project) => {
@@ -627,6 +648,7 @@ export default function App() {
             onOpen={(id) => openProject(id)}
             onCreate={() => go("create")}
             onDelete={removeProject}
+            onRename={renameProject}
           />
         )}
 
@@ -657,9 +679,10 @@ export default function App() {
         {studio && (
           <>
             <header className="top">
-              <button className="song-name" onClick={renameProject} title="Rename song">
+              <button className="song-name" onClick={() => renameProject()} title="Rename song">
                 <span className="lbl">Song</span>
                 <b>{project.name}</b>
+                <PencilIcon />
               </button>
               <div className="top-meta">
                 <span>{fmtTime(totalSec)}</span>
@@ -703,12 +726,27 @@ export default function App() {
                   <button className="round" onClick={playFromStart} title="Play from the beginning" aria-label="Play from start">
                     <StartIcon />
                   </button>
-                  <button className="play" onClick={togglePlay} disabled={!!loading && !playing} aria-label="Play / pause" title="Play from here (space)">
-                    {loading && !playing ? <span className="spin" /> : playing ? <PauseIcon /> : <PlayIcon />}
+                  <button
+                    className="play"
+                    onClick={() => playMode(false)}
+                    disabled={!!loading && !playing}
+                    aria-label={playing && !withVocal ? "Pause" : "Play the band"}
+                    title="Play the band only (space pauses)"
+                  >
+                    {loading && !playing ? <span className="spin" /> : playing && !withVocal ? <PauseIcon /> : <PlayIcon />}
                   </button>
                   <button className="round" onClick={backToStart} aria-label="Stop" title="Stop and go back to the start">
                     <StopIcon />
                   </button>
+                  {activeTake && !recording && (
+                    <button className={`vox ${playing && withVocal ? "on" : ""}`} onClick={() => playMode(true)} title={`Play the band with ${activeTake.name}`}>
+                      {playing && withVocal ? <PauseIcon /> : <PlayIcon />}
+                      <span>
+                        <small>with</small>
+                        {activeTake.name}
+                      </span>
+                    </button>
+                  )}
                   <div className="rec-group">
                     <button className={`rec ${recording ? "live" : ""}`} onClick={() => startRecording(0)} disabled={!!busy}>
                       <i style={{ ["--lvl" as string]: micLevel }} />
@@ -728,7 +766,7 @@ export default function App() {
                     </div>
                     <div className="sub">
                       {instrumentDef.label} · {STYLES.find((s) => s.id === opts.style)?.label}
-                      {activeTake && !recording && (
+                      {activeTake && !recording && withVocal && (
                         <>
                           {" "}
                           · 🎤 {activeTake.name}
@@ -749,7 +787,7 @@ export default function App() {
                 beat={beat}
                 bpm={song.bpm}
                 loopBlock={loopBlock}
-                takeSpan={activeTake && !recording ? [takeOffset(activeTake, sync), takeOffset(activeTake, sync) + activeTake.data.length / activeTake.sampleRate] : null}
+                takeSpan={activeTake && !recording && withVocal ? [takeOffset(activeTake, sync), takeOffset(activeTake, sync) + activeTake.data.length / activeTake.sampleRate] : null}
                 totalSec={totalSec}
                 onSeek={seek}
                 onLoop={(i) => setLoopBlock((cur) => (cur === i ? null : i))}
@@ -940,11 +978,25 @@ structure: Mukhda x2, Antara, Mukhda`}</pre>
                     <div key={t.id} className={`take ${selectedTake === t.id ? "on" : ""}`} onClick={() => setSelectedTake(t.id)}>
                       <span className="pick" />
                       <input
+                        id={`take-name-${t.id}`}
                         className="take-name"
                         defaultValue={t.name}
                         onClick={(e) => e.stopPropagation()}
                         onBlur={(e) => e.target.value.trim() && updateTake(t.id, { name: e.target.value.trim() })}
+                        onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
                       />
+                      <button
+                        className="mini ghosty"
+                        title="Rename take"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const el = document.getElementById(`take-name-${t.id}`) as HTMLInputElement | null;
+                          el?.focus();
+                          el?.select();
+                        }}
+                      >
+                        <PencilIcon />
+                      </button>
                       <span className="take-meta">
                         {fmtTime(t.data.length / t.sampleRate)} · {VOICE_PRESETS.find((p) => p.id === v.preset)?.label}
                         {v.tune > 0 && " + tune"}
@@ -1075,7 +1127,14 @@ structure: Mukhda x2, Antara, Mukhda`}</pre>
 
 // ---------------------------------------------------------------- pages
 
-function HomePage(props: { projects: Project[]; currentId: string; onOpen: (id: string) => void; onCreate: () => void; onDelete: (p: Project) => void }) {
+function HomePage(props: {
+  projects: Project[];
+  currentId: string;
+  onOpen: (id: string) => void;
+  onCreate: () => void;
+  onDelete: (p: Project) => void;
+  onRename: (p: Project) => void;
+}) {
   const list = [...props.projects].sort((a, b) => b.updatedAt - a.updatedAt);
   return (
     <section className="page">
@@ -1108,18 +1167,29 @@ function HomePage(props: { projects: Project[]; currentId: string; onOpen: (id: 
               <span>
                 {bpm} bpm · {inst}
               </span>
-              {props.projects.length > 1 && (
+              <div className="card-actions">
                 <button
-                  className="card-del"
-                  title="Delete song"
+                  title="Rename song"
                   onClick={(e) => {
                     e.stopPropagation();
-                    props.onDelete(p);
+                    props.onRename(p);
                   }}
                 >
-                  ×
+                  <PencilIcon />
                 </button>
-              )}
+                {props.projects.length > 1 && (
+                  <button
+                    className="del"
+                    title="Delete song"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      props.onDelete(p);
+                    }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             </div>
           );
         })}
@@ -1414,5 +1484,14 @@ function Strip(props: {
         <div className="head" style={{ left: `${totalBeats ? (beat / totalBeats) * 100 : 0}%` }} />
       </div>
     </div>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z" />
+      <path d="m13.5 6.5 4 4" />
+    </svg>
   );
 }
