@@ -3,7 +3,7 @@
 Type or upload a chord map, choose an instrument and a feel, and hear the full instrumental in the browser. You can export it as a WAV to sing over.
 
 ```bash
-cd web && npm install && npm run dev   # http://localhost:5180
+npm install && npm run dev   # http://localhost:5180
 ```
 
 ## Chord map format
