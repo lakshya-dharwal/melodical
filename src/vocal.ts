@@ -241,3 +241,73 @@ export function autotune(x: Float32Array, sr: number, scale: number[], strength:
   for (let i = 0; i < out.length; i++) out[i] = wsum[i] > 0.1 ? out[i] / wsum[i] : out[i];
   return out;
 }
+
+// ---------- sync test ----------
+
+export const SYNC_CLICKS = 8;
+export const SYNC_INTERVAL = 0.6; // 100 bpm
+
+/**
+ * Measures the real round trip (speakers/headphones → your ears → your voice/hands → mic → app).
+ * Plays 8 clicks; you clap (or say "ta") on each. The median gap between each click and the
+ * matching onset in the mic is exactly what a take needs to be shifted by.
+ */
+export async function runSyncTest(
+  ctx: AudioContext,
+  rec: MicRecorder,
+  onClick: (i: number) => void,
+): Promise<{ latency: number; hits: number } | null> {
+  await rec.init();
+  await ctx.resume();
+  const start = ctx.currentTime + 1.0;
+  const clicks: number[] = [];
+  for (let i = 0; i < SYNC_CLICKS; i++) {
+    const t = start + i * SYNC_INTERVAL;
+    clicks.push(t);
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.frequency.value = i % 4 === 0 ? 1760 : 1320;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.6, t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    o.connect(g).connect(ctx.destination);
+    o.start(t);
+    o.stop(t + 0.08);
+    setTimeout(() => onClick(i), Math.max(0, (t - ctx.currentTime) * 1000));
+  }
+  rec.start();
+  const end = clicks[clicks.length - 1] + 0.8;
+  await new Promise((r) => setTimeout(r, (end - ctx.currentTime) * 1000));
+  const r = rec.stop();
+  if (!r) return null;
+
+  // envelope in 2 ms frames, then rising-edge onsets
+  const sr = ctx.sampleRate;
+  const hop = Math.round(sr * 0.002);
+  const env: number[] = [];
+  for (let i = 0; i + hop <= r.data.length; i += hop) {
+    let m = 0;
+    for (let j = i; j < i + hop; j++) m = Math.max(m, Math.abs(r.data[j]));
+    env.push(m);
+  }
+  const peak = Math.max(...env);
+  const thresh = Math.max(0.05, peak * 0.3);
+  const onsets: number[] = [];
+  let last = -Infinity;
+  for (let k = 1; k < env.length; k++) {
+    const t = r.t0 + (k * hop) / sr;
+    if (env[k] >= thresh && env[k - 1] < thresh && t - last > 0.25) {
+      onsets.push(t);
+      last = t;
+    }
+  }
+  const gaps: number[] = [];
+  for (const c of clicks) {
+    const near = onsets.filter((o) => o > c - 0.12 && o < c + 0.45).sort((a, b) => Math.abs(a - c) - Math.abs(b - c))[0];
+    if (near !== undefined) gaps.push(near - c);
+  }
+  if (gaps.length < 4) return null;
+  gaps.sort((a, b) => a - b);
+  const latency = gaps[Math.floor(gaps.length / 2)];
+  return { latency: Math.max(0, Math.min(0.5, latency)), hits: gaps.length };
+}

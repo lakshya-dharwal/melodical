@@ -1,6 +1,6 @@
 // Projects live in localStorage (small JSON); vocal takes live in IndexedDB (big Float32 audio).
 import type { Options } from "./engine";
-import { DEFAULT_MIX, type MixSettings } from "./mix";
+import { DEFAULT_MIX, DEFAULT_VOICE, voiceFromPreset, type MixSettings, type Voice } from "./mix";
 
 export type Project = {
   id: string;
@@ -9,6 +9,7 @@ export type Project = {
   transpose: number;
   opts: Options;
   mix: MixSettings;
+  legacyMix?: { mode?: string; vocalReverb?: number; tune?: number }; // pre-per-take vocal settings
   selectedTake: string | null;
   updatedAt: number;
 };
@@ -19,10 +20,49 @@ export type Take = {
   name: string;
   createdAt: number;
   sampleRate: number;
-  offset: number; // song seconds where the first sample sits
+  offset: number; // song seconds where the first sample sits, with `latencyUsed` already removed
+  latencyUsed?: number; // round-trip seconds subtracted when the take was saved
+  nudgeMs?: number; // manual fine-tune, + = earlier
+  voice?: Voice;
   bpm: number; // tempo it was sung against
   data: Float32Array;
 };
+
+/** Takes saved before sync existed assumed ~25 ms of round trip. */
+const LEGACY_LATENCY = 0.025;
+
+/** Where the take sits on the song timeline, using the current sync calibration. */
+export function takeOffset(t: Take, latency: number | null) {
+  const used = t.latencyUsed ?? LEGACY_LATENCY;
+  const shift = latency === null ? 0 : used - latency; // re-apply with the measured value
+  return t.offset + shift - (t.nudgeMs ?? 0) / 1000;
+}
+
+export function takeVoice(t: Take, legacyMix?: { mode?: string; vocalReverb?: number; tune?: number }): Voice {
+  if (t.voice) return t.voice;
+  if (!legacyMix) return DEFAULT_VOICE;
+  const base = voiceFromPreset(legacyMix.mode === "pure" ? "pure" : "natural", legacyMix.mode === "tuned" ? legacyMix.tune ?? 0.8 : 0);
+  return { ...base, reverb: legacyMix.mode === "pure" ? 0 : legacyMix.vocalReverb ?? base.reverb };
+}
+
+// ---------- device sync calibration (per browser, not per song) ----------
+const SYNC_KEY = "melodical.sync.v1";
+export function loadSync(): number | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(SYNC_KEY) ?? "null");
+    return typeof v?.latency === "number" ? v.latency : null;
+  } catch {
+    return null;
+  }
+}
+export function saveSync(latency: number | null) {
+  try {
+    if (latency === null) localStorage.removeItem(SYNC_KEY);
+    else localStorage.setItem(SYNC_KEY, JSON.stringify({ latency, at: Date.now() }));
+  } catch {
+    /* ignore */
+  }
+}
 
 const KEY = "melodical.projects.v1";
 
@@ -31,7 +71,7 @@ export function loadProjects(): { projects: Project[]; currentId: string | null 
     const raw = localStorage.getItem(KEY);
     if (raw) {
       const v = JSON.parse(raw);
-      v.projects = v.projects.map((p: Project) => ({ ...p, mix: { ...DEFAULT_MIX, ...p.mix } }));
+      v.projects = v.projects.map((p: Project) => ({ ...p, legacyMix: p.legacyMix ?? p.mix, mix: { ...DEFAULT_MIX, ...p.mix } }));
       return v;
     }
   } catch {

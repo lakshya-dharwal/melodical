@@ -244,10 +244,59 @@ export function fmtTime(sec: number) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// Starter progressions. The first is the A-minor ballad the Aaina project starts from.
-export const PRESETS: { name: string; text: string }[] = [
+// Plain-English meaning of common section names, shown next to each section.
+const SECTION_HINTS: [RegExp, string][] = [
+  [/^mukhda/i, "the hook, the line people remember"],
+  [/^antara/i, "the story part between hooks"],
+  [/^verse/i, "the story part"],
+  [/^pre-?chorus/i, "the build-up into the hook"],
+  [/^chorus|^hook/i, "the hook, the line people remember"],
+  [/^bridge/i, "a change of mood before the last hook"],
+  [/^intro/i, "how the song opens"],
+  [/^outro/i, "how the song ends"],
+  [/^instrumental|^solo/i, "music only, no singing"],
+];
+export function sectionHint(name: string) {
+  return SECTION_HINTS.find(([re]) => re.test(name))?.[1];
+}
+
+export type Starter = {
+  id: string;
+  name: string;
+  feels: string; // one plain line for beginners
+  bpm: number;
+  instrument: string;
+  style: "ballad" | "arpeggio" | "strum" | "sustain" | "pulse";
+  text: string;
+};
+
+// Popular progressions, slowest to fastest. Each comes fully set up: chords, form, instrument and feel.
+export const STARTERS: Starter[] = [
   {
-    name: "A-minor ballad",
+    id: "soul",
+    name: "Late-night soul",
+    feels: "Smooth, slow, a little jazzy",
+    bpm: 72,
+    instrument: "epiano",
+    style: "sustain",
+    text: `title: Untitled
+tempo: 72
+
+[Verse]
+Dm7  G7  Cmaj7  Am7
+
+[Chorus]
+Fmaj7  Em7  Dm7  G7
+
+structure: Verse x2, Chorus, Verse, Chorus x2`,
+  },
+  {
+    id: "aaina",
+    name: "Heartfelt ballad",
+    feels: "Slow and emotional, the Aaina feel",
+    bpm: 80,
+    instrument: "piano",
+    style: "ballad",
     text: `title: Aaina
 tempo: 80
 
@@ -272,9 +321,52 @@ Am  Fmaj7  Am(2)
 structure: Mukhda x2, Pre-chorus, Mukhda x2, Instrumental, Antara 1 x2, Antara 2 x2, Pre-chorus, Mukhda x2, Outro`,
   },
   {
-    name: "Pop four-chord",
-    text: `title: Four Chords
-tempo: 104
+    id: "romance",
+    name: "Bollywood romance",
+    feels: "Sweet and dreamy, made for love songs",
+    bpm: 88,
+    instrument: "nylon",
+    style: "arpeggio",
+    text: `title: Untitled
+tempo: 88
+
+[Mukhda]
+C  Em  Am  F
+
+[Antara]
+F  G  Em  Am
+F  G  C(2)
+
+structure: Mukhda x2, Antara, Mukhda, Antara, Mukhda x2`,
+  },
+  {
+    id: "campfire",
+    name: "Campfire acoustic",
+    feels: "Warm guitar strumming, sing-along",
+    bpm: 100,
+    instrument: "guitar",
+    style: "strum",
+    text: `title: Untitled
+tempo: 100
+
+[Verse]
+G  D  Em  C
+
+[Chorus]
+C  G  D  Em
+C  G  D(2)
+
+structure: Verse x2, Chorus, Verse, Chorus x2`,
+  },
+  {
+    id: "pop",
+    name: "Pop anthem",
+    feels: "Big and catchy, the four chords of pop",
+    bpm: 112,
+    instrument: "piano",
+    style: "pulse",
+    text: `title: Untitled
+tempo: 112
 
 [Verse]
 C  G  Am  F
@@ -286,18 +378,35 @@ F  G  C(2)
 structure: Verse x2, Chorus, Verse, Chorus x2`,
   },
   {
-    name: "Late-night jazz",
-    text: `title: ii–V–I study
-tempo: 92
+    id: "dance",
+    name: "Feel-good dance",
+    feels: "Bright, bouncy, makes you move",
+    bpm: 122,
+    instrument: "synth",
+    style: "pulse",
+    text: `title: Untitled
+tempo: 122
 
-[A]
-Dm9  G13  Cmaj9(2)
-Em7  A7  Dm7  G7
+[Verse]
+Fmaj7  G  Em  Am
 
-[B]
-Fmaj7  Fm6  Em7  A7
-Dm7  G7  Cmaj7(2)
+[Chorus]
+Fmaj7  G  Am  Am
+Fmaj7  G  C  E7
 
-structure: A x2, B, A`,
+structure: Verse x2, Chorus x2, Verse, Chorus x2`,
   },
 ];
+
+/** Flame colour by tempo: yellow (slow) → orange → red → blue → teal-green (fast). */
+export function flame(bpm: number): string {
+  if (bpm < 76) return "#FFC21A";
+  if (bpm < 85) return "#FF9A1F";
+  if (bpm < 95) return "#FF5A36";
+  if (bpm < 106) return "#E0407A";
+  if (bpm < 116) return "#4F7CFF";
+  return "#2FD3B4";
+}
+
+// Kept for the "Paste / upload" quick-load chips.
+export const PRESETS = STARTERS.map((s) => ({ name: s.name, text: s.text }));

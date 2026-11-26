@@ -1,7 +1,7 @@
 // Audio engine: turns the laid-out chord timeline into notes, eighth-note by eighth-note.
 // The same note generator drives live playback (lookahead scheduler) and WAV export (offline render).
 import { ElectricPiano, renderOffline, Soundfont, SplendidGrandPiano, type NoteEvent } from "smplr";
-import { buildMaster, buildVocalChain, DEFAULT_MIX, impulse, type MixSettings, type VocalChain, type MasterChain, type VocalClip } from "./mix";
+import { buildMaster, buildVocalChain, DEFAULT_MIX, DEFAULT_VOICE, impulse, type MasterChain, type MixSettings, type VocalChain, type VocalClip, type Voice as VocalVoice } from "./mix";
 import type { Block } from "./song";
 import { bassNote, fifthAbove, guitarVoicing, keysVoicing, parseChord, type ParsedChord } from "./theory";
 
@@ -385,6 +385,8 @@ export class Player {
   private master: MasterChain;
   private vocalChain: VocalChain;
   private vocal: VocalClip | null = null;
+  private voice: VocalVoice = DEFAULT_VOICE;
+  private mix: MixSettings = DEFAULT_MIX;
   private vocalSrc: AudioBufferSourceNode | null = null;
   private vocalBuf: AudioBuffer | null = null;
   private voices = new Map<string, Voice>();
@@ -431,9 +433,15 @@ export class Player {
   }
 
   setMix(m: MixSettings) {
+    this.mix = m;
     this.instGain.gain.value = m.inst;
-    this.vocalChain.set(m);
     this.master.set(m.master);
+    this.vocalChain.set(this.voice, m.vocal, this.bpm);
+  }
+
+  setVoice(v: VocalVoice) {
+    this.voice = v;
+    this.vocalChain.set(v, this.mix.vocal, this.bpm);
   }
 
   /** The take that plays along with the band (null = none). */
@@ -454,6 +462,7 @@ export class Player {
   }
 
   setBpm(bpm: number) {
+    this.vocalChain.set(this.voice, this.mix.vocal, bpm);
     if (this.playing) {
       const beat = this.getBeat();
       this.bpm = bpm;
