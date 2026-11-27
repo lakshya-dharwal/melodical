@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { askConfirm, askText, DialogHost, notify } from "./dialog";
 import { INSTRUMENTS, instrumentalKey, isRendered, Player, renderInstrumental, STYLES, type Options, type Style } from "./engine";
+import { ACCEPT, buildSong, fileToText, parseLoose, songSeconds } from "./importer";
 import { Logo } from "./Logo";
 import {
   DEFAULT_MIX,
@@ -30,6 +31,7 @@ import {
   sectionHint,
   serializeSong,
   STARTERS,
+  type Section,
   type Song,
   type Starter,
 } from "./song";
@@ -64,11 +66,13 @@ const DEFAULT_OPTS: Options = {
 // Warm, low-chroma section tints so the strip reads as one palette with the sun-yellow accent.
 const TINTS = ["#FFC21A", "#F5A524", "#E8D7A8", "#C98A3B", "#FFE58A", "#B8A27A", "#F0B75E", "#D9C38F"];
 
-function projectFrom(name: string, s: Starter): Project {
+type Seed = Pick<Starter, "text" | "instrument"> & { style: Style };
+
+function projectFrom(name: string, s: Seed): Project {
   return {
     id: uid(),
     name,
-    text: s.text.replace(/^title:.*$/m, `title: ${name}`),
+    text: /^title:/m.test(s.text) ? s.text.replace(/^title:.*$/m, `title: ${name}`) : `title: ${name}\n${s.text}`,
     transpose: 0,
     opts: { ...DEFAULT_OPTS, instrument: s.instrument, style: s.style },
     mix: DEFAULT_MIX,
@@ -580,7 +584,7 @@ export default function App() {
     setPage(to);
   };
 
-  const createProject = (name: string, starter: Starter) => {
+  const createProject = (name: string, starter: Seed) => {
     const p = projectFrom(name, starter);
     const next = [...projects, p];
     setProjects(next);
@@ -1198,11 +1202,19 @@ function HomePage(props: {
   );
 }
 
-function CreatePage({ onCreate, onCancel }: { onCreate: (name: string, s: Starter) => void; onCancel: () => void }) {
+function CreatePage({ onCreate, onCancel }: { onCreate: (name: string, s: Seed) => void; onCancel: () => void }) {
   const [name, setName] = useState("");
   const [pick, setPick] = useState(STARTERS[1].id);
-  const starter = STARTERS.find((s) => s.id === pick)!;
-  const go = () => name.trim() && onCreate(name.trim(), starter);
+  const custom = useCustomSong();
+  const isCustom = pick === CUSTOM;
+  const canCreate = !!name.trim() && (!isCustom || custom.sections.length > 0);
+  const go = () => {
+    if (!canCreate) return;
+    if (isCustom) {
+      const song = buildSong(name.trim(), custom.bpm, custom.sections, custom.minutes);
+      onCreate(name.trim(), { text: serializeSong(song), instrument: custom.instrument, style: custom.style });
+    } else onCreate(name.trim(), STARTERS.find((s) => s.id === pick)!);
+  };
   return (
     <section className="page">
       <div className="page-head">
@@ -1236,16 +1248,215 @@ function CreatePage({ onCreate, onCancel }: { onCreate: (name: string, s: Starte
             </button>
           );
         })}
+        <button className={`vibe custom ${isCustom ? "on" : ""}`} onClick={() => setPick(CUSTOM)}>
+          <span className="custom-icon" aria-hidden>
+            <svg viewBox="0 0 24 24" width="22" height="22">
+              <path d="M12 4v11m0-11-4 4m4-4 4 4M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </span>
+          <div className="custom-copy">
+            <b>Custom</b>
+            <span className="vibe-feels">Bring your own chords. Paste them, or upload a file or a screenshot.</span>
+          </div>
+          <span className="custom-tag">{isCustom ? "Selected" : "Your chords"}</span>
+        </button>
       </div>
+      {isCustom && <CustomPanel c={custom} />}
       <div className="create-actions">
+        {isCustom && !custom.sections.length && <span className="create-hint">Add some chords to continue</span>}
         <button className="ghost" onClick={onCancel}>
           Cancel
         </button>
-        <button className="primary big" disabled={!name.trim()} onClick={go}>
+        <button className="primary big" disabled={!canCreate} onClick={go}>
           Create song
         </button>
       </div>
     </section>
+  );
+}
+
+const CUSTOM = "custom";
+const CUSTOM_PLACEHOLDER = `Paste chords any way you like, for example:
+
+Mukhda
+Am  Fmaj7  C  G
+
+Pre-chorus
+Dm7  Am  F  E7
+
+Chorus: F G Em Am`;
+const LENGTHS: { id: string; label: string; min: number | null }[] = [
+  { id: "once", label: "Once through", min: null },
+  { id: "2", label: "~2 min", min: 2 },
+  { id: "3", label: "~3 min", min: 3 },
+  { id: "4", label: "~4 min", min: 4 },
+];
+
+function useCustomSong() {
+  const [text, setText] = useState("");
+  const [bpm, setBpm] = useState(90);
+  const [bpmTouched, setBpmTouched] = useState(false);
+  const [length, setLength] = useState("once");
+  const [instrument, setInstrument] = useState("piano");
+  const [style, setStyle] = useState<Style>("ballad");
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const parsed = useMemo(() => parseLoose(text), [text]);
+  useEffect(() => {
+    if (parsed.bpm && !bpmTouched) setBpm(parsed.bpm);
+  }, [parsed.bpm, bpmTouched]);
+  const minutes = LENGTHS.find((l) => l.id === length)?.min ?? null;
+  const readFile = async (file: File) => {
+    setError(null);
+    setStatus("Reading…");
+    try {
+      const t = await fileToText(file, setStatus);
+      if (!t.trim()) setError(`Couldn't find any text in ${file.name}`);
+      else setText(t.trim());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Couldn't read ${file.name}`);
+    } finally {
+      setStatus(null);
+    }
+  };
+  return {
+    text,
+    setText,
+    bpm,
+    setBpm: (v: number) => {
+      setBpmTouched(true);
+      setBpm(Math.min(220, Math.max(40, v)));
+    },
+    length,
+    setLength,
+    minutes,
+    instrument,
+    setInstrument,
+    style,
+    setStyle,
+    status,
+    error,
+    readFile,
+    sections: parsed.sections as Section[],
+    warnings: parsed.warnings,
+  };
+}
+
+function CustomPanel({ c }: { c: ReturnType<typeof useCustomSong> }) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [drag, setDrag] = useState(false);
+  const preview = useMemo(() => (c.sections.length ? buildSong("Preview", c.bpm, c.sections, c.minutes) : null), [c.sections, c.bpm, c.minutes]);
+  const structure = preview?.structure.map((s) => (s.repeat > 1 ? `${s.name} ×${s.repeat}` : s.name)).join(" → ");
+  return (
+    <div className="custom-panel">
+      <div className="custom-grid">
+        <div className="custom-in">
+          <Label>Your chords</Label>
+          <div
+            className={`drop ${drag ? "over" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDrag(true);
+            }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDrag(false);
+              const f = e.dataTransfer.files[0];
+              if (f) c.readFile(f);
+            }}
+          >
+            <textarea value={c.text} placeholder={CUSTOM_PLACEHOLDER} spellCheck={false} onChange={(e) => c.setText(e.target.value)} />
+            {drag && <div className="drop-veil">Drop to read chords</div>}
+          </div>
+          <div className="upload-row">
+            <button className="ghost" onClick={() => fileRef.current?.click()} disabled={!!c.status}>
+              Upload a file or screenshot
+            </button>
+            <span className="upload-note">Text, CSV, JSON, Excel or a picture. You can also drop it on the box.</span>
+            <input
+              ref={fileRef}
+              type="file"
+              accept={ACCEPT}
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) c.readFile(f);
+                e.target.value = "";
+              }}
+            />
+          </div>
+          {c.status && (
+            <div className="read-status">
+              <i className="dot-spin" />
+              {c.status}
+            </div>
+          )}
+          {c.error && <div className="read-status err">{c.error}</div>}
+        </div>
+
+        <div className="custom-preview">
+          <div className="preview-head">
+            <Label>What I found</Label>
+            {preview && (
+              <span className="preview-len">
+                {c.sections.length} section{c.sections.length > 1 ? "s" : ""} · {fmtTime(songSeconds(preview))}
+              </span>
+            )}
+          </div>
+          {preview ? (
+            <>
+              <div className="preview-secs">
+                {c.sections.map((s) => (
+                  <div className="preview-sec" key={s.name}>
+                    <b>{s.name}</b>
+                    <div className="card-chords">
+                      {s.chords.map((ch, i) => (
+                        <span key={i}>
+                          {ch.symbol}
+                          {ch.bars !== 1 && <small>×{ch.bars}</small>}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="preview-form">
+                <span>Plays as</span> {structure}
+              </div>
+            </>
+          ) : (
+            <div className="preview-empty">Your sections will show up here as you paste.</div>
+          )}
+          {c.warnings.length > 0 && (
+            <ul className="preview-warn">
+              {c.warnings.slice(0, 4).map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+              {c.warnings.length > 4 && <li>…and {c.warnings.length - 4} more</li>}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <div className="custom-opts">
+        <div className="opt">
+          <Stepper label="Tempo" value={c.bpm} unit="bpm" step={2} onChange={c.setBpm} />
+        </div>
+        <div className="opt">
+          <Label>Length</Label>
+          <Chips value={c.length} options={LENGTHS} onChange={c.setLength} />
+        </div>
+        <div className="opt">
+          <Label>Instrument</Label>
+          <Chips value={c.instrument} options={INSTRUMENTS.map((i) => ({ id: i.id, label: i.label }))} onChange={c.setInstrument} />
+        </div>
+        <div className="opt">
+          <Label>Feel</Label>
+          <Chips value={c.style} options={STYLES} onChange={c.setStyle} />
+        </div>
+      </div>
+    </div>
   );
 }
 
