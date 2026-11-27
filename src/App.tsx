@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { cloud, useCloud, type CloudState, type PullResult } from "./cloud";
 import { askConfirm, askText, DialogHost, notify } from "./dialog";
 import { INSTRUMENTS, instrumentalKey, isRendered, Player, renderInstrumental, STYLES, type Options, type Style } from "./engine";
 import { ACCEPT, buildSong, fileToText, parseLoose, songSeconds } from "./importer";
@@ -46,6 +47,7 @@ import {
   takeOffset,
   takeVoice,
   uid,
+  writeProjectsRaw,
   type Project,
   type Take,
 } from "./store";
@@ -85,11 +87,20 @@ const boot = (() => {
   const s = loadProjects();
   if (s.projects.length && s.projects.some((p) => p.id === s.currentId)) return s;
   if (s.projects.length) return { projects: s.projects, currentId: s.projects[0].id };
-  const p = projectFrom("Aaina", STARTERS.find((x) => x.id === "aaina")!);
+  const p: Project = { ...projectFrom("Aaina", STARTERS.find((x) => x.id === "aaina")!), seed: true };
   return { projects: [p], currentId: p.id };
 })();
 const bootProject = boot.projects.find((p) => p.id === boot.currentId)!;
 const bootParse = parseChordMap(bootProject.text);
+
+/** Structural equality for small JSON-ish values (key order doesn't matter). */
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || !a || !b) return false;
+  const ka = Object.keys(a as object).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
+  const kb = Object.keys(b as object).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => same((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
 
 const safe = (s: string) => s.replace(/[^\w\- ]+/g, "").trim() || "song";
 const bpmOf = (text: string) => Number(text.match(/^tempo:\s*(\d+)/m)?.[1] ?? 90);
@@ -153,7 +164,16 @@ export default function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       setProjects((ps) => {
-        const next = ps.map((p) => (p.id === currentId ? { ...p, text, opts, transpose, mix, selectedTake, updatedAt: Date.now() } : p));
+        const cur = ps.find((p) => p.id === currentId);
+        if (!cur) return ps;
+        // Only a real edit bumps updatedAt; opening or switching songs must not (stale devices would win sync).
+        const unchanged =
+          cur.text === text && cur.transpose === transpose && cur.selectedTake === selectedTake && same(cur.opts, opts) && same({ ...DEFAULT_MIX, ...cur.mix }, mix);
+        if (unchanged) {
+          writeProjectsRaw(ps, currentId); // remember which song is open
+          return ps;
+        }
+        const next = ps.map((p) => (p.id === currentId ? { ...p, text, opts, transpose, mix, selectedTake, updatedAt: Date.now(), seed: undefined } : p));
         saveProjects(next, currentId);
         return next;
       });
@@ -597,7 +617,7 @@ export default function App() {
     if (!name || name === target.name) return;
     const retitle = (t: string) => (/^title:/m.test(t) ? t.replace(/^title:.*$/m, `title: ${name}`) : `title: ${name}\n${t}`);
     setProjects((ps) => {
-      const next = ps.map((p) => (p.id === target.id ? { ...p, name, text: p.id === currentId ? p.text : retitle(p.text) } : p));
+      const next = ps.map((p) => (p.id === target.id ? { ...p, name, text: p.id === currentId ? p.text : retitle(p.text), updatedAt: Date.now(), seed: undefined } : p));
       saveProjects(next, currentId);
       return next;
     });
@@ -624,6 +644,49 @@ export default function App() {
     setPage(p);
     window.scrollTo({ top: 0 });
   };
+
+  // ---------- cloud backup (no-op unless configured) ----------
+  const cloudState = useCloud();
+  const onPull = (r: PullResult) => {
+    let merged = r.projects;
+    if (!merged.length) {
+      // every song was deleted on another device: start fresh rather than leave the app empty
+      const p = projectFrom("Aaina", STARTERS.find((x) => x.id === "aaina")!);
+      merged = [p];
+      saveProjects(merged, p.id);
+    }
+    const before = projects.find((p) => p.id === currentId);
+    const now = merged.find((p) => p.id === currentId);
+    setProjects(merged);
+    if (!now) {
+      openProject(merged[0].id, merged, page === "home" || page === "settings" ? page : "home");
+      return;
+    }
+    if (before && before.updatedAt !== now.updatedAt && !recMeta.current) {
+      const parsed = parseChordMap(now.text);
+      setSong(parsed.song);
+      setText(now.text);
+      setWarnings(parsed.warnings);
+      setDirty(false);
+      setTranspose(now.transpose);
+      setMix({ ...DEFAULT_MIX, ...now.mix });
+      setSelectedTake(now.selectedTake);
+      if (now.opts.instrument !== opts.instrument) {
+        setLoading(now.opts.instrument);
+        player.load(now.opts.instrument).finally(() => setLoading(null));
+      }
+      setOpts(now.opts);
+    }
+    if (r.takesChanged.has(currentId)) getTakes(currentId).then(setTakes);
+  };
+  const onPullRef = useRef(onPull);
+  onPullRef.current = onPull;
+  useEffect(() => {
+    if (!cloud.enabled) return;
+    const off = cloud.onPull((r) => onPullRef.current(r));
+    cloud.start();
+    return off;
+  }, []);
 
   // ---------- derived view state ----------
   const block = blocks.find((b) => beat >= b.startBeat && beat < b.startBeat + b.beats) ?? blocks[0];
@@ -653,6 +716,7 @@ export default function App() {
             onCreate={() => go("create")}
             onDelete={removeProject}
             onRename={renameProject}
+            cloud={cloudState}
           />
         )}
 
@@ -660,6 +724,7 @@ export default function App() {
 
         {page === "settings" && (
           <SettingsPage
+            cloud={cloudState}
             sync={sync}
             onRun={() => setSyncUi({ phase: "intro", click: -1 })}
             onReset={() => {
@@ -1138,6 +1203,7 @@ function HomePage(props: {
   onCreate: () => void;
   onDelete: (p: Project) => void;
   onRename: (p: Project) => void;
+  cloud: CloudState;
 }) {
   const list = [...props.projects].sort((a, b) => b.updatedAt - a.updatedAt);
   return (
@@ -1148,6 +1214,7 @@ function HomePage(props: {
           <h1>Your songs</h1>
           <p>Bring the chords, we’ll bring the band. Then sing.</p>
         </div>
+        {props.cloud.user && <CloudPill s={props.cloud} />}
       </div>
       <div className="song-grid">
         <button className="song-card new" onClick={props.onCreate}>
@@ -1460,7 +1527,7 @@ function CustomPanel({ c }: { c: ReturnType<typeof useCustomSong> }) {
   );
 }
 
-function SettingsPage({ sync, onRun, onReset }: { sync: number | null; onRun: () => void; onReset: () => void }) {
+function SettingsPage({ cloud: cs, sync, onRun, onReset }: { cloud: CloudState; sync: number | null; onRun: () => void; onReset: () => void }) {
   return (
     <section className="page narrow">
       <div className="page-head">
@@ -1491,7 +1558,121 @@ function SettingsPage({ sync, onRun, onReset }: { sync: number | null; onRun: ()
           </button>
         )}
       </div>
+      <CloudPanel s={cs} />
     </section>
+  );
+}
+
+// ---------------------------------------------------------------- cloud backup
+
+function ago(t: number | null) {
+  if (!t) return "not yet";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return new Date(t).toLocaleDateString();
+}
+
+function cloudLine(s: CloudState) {
+  if (s.status === "syncing") return "Syncing…";
+  if (s.status === "offline") return "Offline, will sync when back";
+  if (s.status === "error") return "Couldn’t sync, retrying";
+  return `Backed up · ${ago(s.lastSync)}`;
+}
+
+/** Re-render every 30 s so “2 min ago” stays true. */
+function useTick() {
+  const [, setT] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setT((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+}
+
+function CloudPill({ s }: { s: CloudState }) {
+  useTick();
+  const color = s.status === "error" ? "var(--red)" : s.status === "offline" ? "var(--mute)" : s.status === "syncing" ? "var(--sun)" : "var(--tide)";
+  return (
+    <span
+      title={s.user?.email ?? ""}
+      style={{ marginLeft: "auto", alignSelf: "flex-start", display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 12px", borderRadius: 99, border: "1px solid var(--line-2)", fontSize: 12, color: "var(--mute)", whiteSpace: "nowrap" }}
+    >
+      <i style={{ width: 7, height: 7, borderRadius: "50%", background: color, flex: "none" }} />
+      {cloudLine(s)}
+    </span>
+  );
+}
+
+function CloudPanel({ s }: { s: CloudState }) {
+  useTick();
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const sendLink = async () => {
+    const e = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return notify("Check the email", "That doesn’t look like an email address.");
+    setBusy(true);
+    const r = await cloud.sendMagicLink(e);
+    setBusy(false);
+    if (r.error) return notify("Couldn’t send the link", r.error);
+    setSent(e);
+  };
+  const google = async () => {
+    const r = await cloud.signInWithGoogle();
+    if (r.error) notify("Couldn’t sign in", r.error);
+  };
+  return (
+    <div className="panel" style={{ marginTop: 16 }}>
+      <Label>Cloud backup</Label>
+      {!s.enabled ? (
+        <p className="hint" style={{ marginTop: 4 }}>
+          Backup isn’t connected yet. Your songs and takes are saved in this browser.
+        </p>
+      ) : !s.ready ? (
+        <p className="hint" style={{ marginTop: 4 }}>Checking…</p>
+      ) : s.user ? (
+        <>
+          <div className="sync-row">
+            <div>
+              <b style={{ fontSize: 18, overflow: "hidden", textOverflow: "ellipsis" }}>{s.user.email ?? "Signed in"}</b>
+              <span style={{ color: s.status === "error" ? "var(--red)" : s.status === "syncing" ? "var(--sun)" : undefined }}>{cloudLine(s)}</span>
+            </div>
+            <button className="ghost" onClick={() => cloud.signOut()}>
+              Sign out
+            </button>
+          </div>
+          <p className="hint">Songs and takes sync to every browser you sign in on. Takes are stored losslessly as FLAC.</p>
+        </>
+      ) : (
+        <>
+          <p className="hint" style={{ marginTop: 4, marginBottom: 14 }}>
+            Sign in to keep your songs and takes safe and open them on any device.
+          </p>
+          <button className="primary" style={{ width: "100%" }} onClick={google}>
+            Continue with Google
+          </button>
+          {sent ? (
+            <p className="hint">Check {sent} for a sign-in link. You can close this tab after you open it.</p>
+          ) : (
+            <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+              <input
+                className="field"
+                type="email"
+                placeholder="you@email.com"
+                value={email}
+                style={{ flex: 1, minWidth: 0 }}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && !busy && sendLink()}
+              />
+              <button className="ghost" disabled={busy} onClick={sendLink}>
+                {busy ? "Sending…" : "Send link"}
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

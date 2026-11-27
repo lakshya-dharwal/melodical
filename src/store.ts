@@ -12,6 +12,7 @@ export type Project = {
   legacyMix?: { mode?: string; vocalReverb?: number; tune?: number }; // pre-per-take vocal settings
   selectedTake: string | null;
   updatedAt: number;
+  seed?: boolean; // the untouched starter a fresh browser opens with (dropped on first cloud sign-in)
 };
 
 export type Take = {
@@ -80,12 +81,32 @@ export function loadProjects(): { projects: Project[]; currentId: string | null 
   return { projects: [], currentId: null };
 }
 
-export function saveProjects(projects: Project[], currentId: string | null) {
+// ---------- change hook (cloud sync listens here; nothing is registered without cloud config) ----------
+export type StoreEvent = { type: "projects"; projects: Project[] } | { type: "putTake"; take: Take } | { type: "deleteTake"; id: string };
+let hook: ((e: StoreEvent) => void) | null = null;
+export function onStoreChange(h: ((e: StoreEvent) => void) | null) {
+  hook = h;
+}
+const fire = (e: StoreEvent) => {
+  try {
+    hook?.(e);
+  } catch (err) {
+    console.warn("store hook failed", err);
+  }
+};
+
+/** Write projects without notifying the hook (used when applying changes pulled from the cloud). */
+export function writeProjectsRaw(projects: Project[], currentId: string | null) {
   try {
     localStorage.setItem(KEY, JSON.stringify({ projects, currentId }));
   } catch (e) {
     console.warn("couldn't save projects", e);
   }
+}
+
+export function saveProjects(projects: Project[], currentId: string | null) {
+  writeProjectsRaw(projects, currentId);
+  fire({ type: "projects", projects });
 }
 
 export const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
@@ -115,7 +136,14 @@ function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T
   );
 }
 
-export const putTake = (t: Take) => tx("readwrite", (s) => s.put(t));
-export const deleteTake = (id: string) => tx("readwrite", (s) => s.delete(id));
+/** Raw writes skip the change hook (cloud pulls use these so they don't echo back up). */
+export const putTakeRaw = (t: Take) => tx("readwrite", (s) => s.put(t));
+export const deleteTakeRaw = (id: string) => tx("readwrite", (s) => s.delete(id));
+export const putTake = (t: Take) => putTakeRaw(t).then((r) => (fire({ type: "putTake", take: t }), r));
+export const deleteTake = (id: string) => deleteTakeRaw(id).then((r) => (fire({ type: "deleteTake", id }), r));
+export const getTake = (id: string) => tx<Take | undefined>("readonly", (s) => s.get(id));
+export const getTakeIds = () => tx<IDBValidKey[]>("readonly", (s) => s.getAllKeys()).then((ks) => ks.map(String));
+export const getTakeIdsFor = (projectId: string) =>
+  tx<IDBValidKey[]>("readonly", (s) => s.index("project").getAllKeys(projectId)).then((ks) => ks.map(String));
 export const getTakes = (projectId: string) =>
   tx<Take[]>("readonly", (s) => s.index("project").getAll(projectId)).then((ts) => ts.sort((a, b) => a.createdAt - b.createdAt));
